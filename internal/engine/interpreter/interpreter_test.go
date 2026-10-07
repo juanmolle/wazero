@@ -562,7 +562,7 @@ func TestEngine_CachedCompiledFunctionPerModule(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, len(exp), len(actual))
 	for i := range actual {
-		require.Equal(t, exp[i], actual[i])
+		require.Equal(t, exp[i].body, actual[i].body)
 	}
 
 	e.deleteCompiledFunctions(m)

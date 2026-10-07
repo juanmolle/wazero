@@ -34,6 +34,10 @@ type engine struct {
 	mux               sync.RWMutex
 	// labelAddressResolutionCache is the temporary cache used to map LabelKind -> FrameID -> the index to the body.
 	labelAddressResolutionCache [wazeroir.LabelKindNum][]uint64
+	// lowerMux serialises lazy lowering across every module of this engine:
+	// lowerIR uses labelAddressResolutionCache, and each module's IR compiler
+	// is not safe for concurrent use.
+	lowerMux sync.Mutex
 }
 
 func NewEngine(_ context.Context, enabledFeatures api.CoreFeatures, _ filecache.Cache) wasm.Engine {
@@ -187,7 +191,20 @@ type callFrame struct {
 	base int
 }
 
+// lazyLowering is shared by every function of one compiled module. It keeps the
+// IR compiler so function bodies can be lowered on first call instead of eagerly
+// in CompileModule. Use it only while holding engine.lowerMux.
+type lazyLowering struct {
+	compiler *wazeroir.Compiler
+	engine   *engine
+}
+
 type compiledFunction struct {
+	lazy      *lazyLowering
+	lowerOnce sync.Once
+	lowerErr  error
+	codeIndex int
+
 	source              *wasm.Module
 	body                []wazeroir.UnionOperation
 	listener            experimental.FunctionListener
@@ -312,6 +329,7 @@ func (e *engine) CompileModule(_ context.Context, module *wasm.Module, listeners
 	if err != nil {
 		return err
 	}
+	lazy := &lazyLowering{compiler: irCompiler, engine: e}
 	imported := module.ImportFunctionCount
 	for i := range module.CodeSection {
 		var lsn experimental.FunctionListener
@@ -326,15 +344,9 @@ func (e *engine) CompileModule(_ context.Context, module *wasm.Module, listeners
 		if codeSeg := &module.CodeSection[i]; codeSeg.GoFunc != nil {
 			compiled.hostFn = codeSeg.GoFunc
 		} else {
-			ir, err := irCompiler.Next()
-			if err != nil {
-				return err
-			}
-			err = e.lowerIR(ir, compiled)
-			if err != nil {
-				def := module.FunctionDefinition(uint32(i) + module.ImportFunctionCount)
-				return fmt.Errorf("failed to lower func[%s] to wazeroir: %w", def.DebugName(), err)
-			}
+			// Lowered on first call; see ensureLowered.
+			compiled.lazy = lazy
+			compiled.codeIndex = i
 		}
 		compiled.source = module
 		compiled.ensureTermination = ensureTermination
@@ -369,6 +381,35 @@ func (e *engine) NewModuleEngine(module *wasm.Module, instance *wasm.ModuleInsta
 		}
 	}
 	return me, nil
+}
+
+// ensureLowered lowers the function body on its first call. Lowering errors are
+// not expected because the module was fully validated when compiled, but if one
+// happens it is remembered and re-raised on every call: sync.Once treats a
+// panicking function as done, so panicking inside Do would leave later calls
+// running an empty body.
+func (c *compiledFunction) ensureLowered() {
+	if c.lazy == nil {
+		return
+	}
+	c.lowerOnce.Do(func() {
+		lazy := c.lazy
+		lazy.engine.lowerMux.Lock()
+		defer lazy.engine.lowerMux.Unlock()
+		ir, err := lazy.compiler.CompileFunction(c.codeIndex)
+		if err == nil {
+			err = lazy.engine.lowerIR(ir, c)
+		}
+		if err != nil {
+			def := c.source.FunctionDefinition(c.index)
+			c.lowerErr = fmt.Errorf("failed to lower func[%s] to wazeroir: %w", def.DebugName(), err)
+		}
+	})
+	if c.lowerErr != nil {
+		// Raised as a panic like any other runtime fault; callEngine.call
+		// recovers it and returns it as the error of api.Function.Call.
+		panic(c.lowerErr)
+	}
 }
 
 // lowerIR lowers the wazeroir operations to engine friendly struct.
@@ -595,6 +636,8 @@ func (ce *callEngine) recoverOnCall(ctx context.Context, m *wasm.ModuleInstance,
 }
 
 func (ce *callEngine) callFunction(ctx context.Context, m *wasm.ModuleInstance, f *function) {
+	// Lower before any listener runs so stack iteration sees source offsets.
+	f.parent.ensureLowered()
 	if f.parent.hostFn != nil {
 		ce.callGoFuncWithStack(ctx, m, f)
 	} else if lsn := f.parent.listener; lsn != nil {
@@ -642,6 +685,7 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 	typeIDs := moduleInst.TypeIDs
 	dataInstances := moduleInst.DataInstances
 	elementInstances := moduleInst.ElementInstances
+	frame.f.parent.ensureLowered()
 	ce.pushFrame(frame)
 	body := frame.f.parent.body
 	bodyLen := uint64(len(body))

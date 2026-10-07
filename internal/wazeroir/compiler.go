@@ -299,6 +299,13 @@ func NewCompiler(enabledFeatures api.CoreFeatures, callFrameStackSizeInUint64 in
 	return c, nil
 }
 
+// CompileFunction compiles the function at codeIndex (an index into the code
+// section) regardless of the order Next would visit it in. Used for lazy lowering.
+func (c *Compiler) CompileFunction(codeIndex int) (*CompilationResult, error) {
+	c.next = codeIndex
+	return c.Next()
+}
+
 // Next returns the next CompilationResult for this Compiler.
 func (c *Compiler) Next() (*CompilationResult, error) {
 	funcIndex := c.next
